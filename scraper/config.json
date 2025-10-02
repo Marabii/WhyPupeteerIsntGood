@@ -1,0 +1,88 @@
+{
+  "targetUrl": "https://www.reddit.com/",
+  "outputDir": "screenshots",
+  "fullscreen": true,
+  "waitUntil": "domcontentloaded",
+  "keepOutlinesInScreenshots": true,
+  "includeIframes": true,
+  "preScrollViewportHeights": 0.8,
+  "delayMs": 50,
+
+  "home": {
+    "maxPerTarget": 2,
+    "targets": ["article.w-full.m-0", "shreddit-ad-post"],
+    "annotations": [
+      ["article.w-full.m-0", "postCard"],
+      ["shreddit-ad-post", "adPost"],
+      ["svg[icon-name='upvote-outline']", "upvote"],
+      ["svg[icon-name='downvote-outline']", "downvote"],
+      ["svg[icon-name='comment-outline']", "comment"]
+    ],
+    "open": {
+      "selector": "a[slot='full-post-link']",
+      "openInNewTab": true,
+      "waitUntil": "domcontentloaded",
+      "stabilizationMs": 800
+    },
+    "infiniteScroll": {
+      "enabled": true,
+      "stableRounds": 6,
+      "step": 1.0,
+      "sleepMs": 350
+    }
+  },
+
+  "post": {
+    "maxShotsPerPost": 3,
+    "targets": ["shreddit-post", "shreddit-comment"],
+    "annotations": [
+      ["h1[slot='title']", "postTitle"],
+      ["div[slot='post-media-container']", "postImage"],
+      ["svg[icon-name='upvote-outline']", "upvote"],
+      ["svg[icon-name='downvote-outline']", "downvote"],
+      [
+        "faceplate-tracker[source='shreddit_comment_count_button']",
+        "joinConversation"
+      ],
+      ["shreddit-comment", "subredditCommentThread"]
+    ],
+    "infiniteScroll": {
+      "enabled": true,
+      "stableRounds": 6,
+      "step": 1.0,
+      "sleepMs": 350
+    },
+    "nav": {
+      "waitUntil": "domcontentloaded",
+      "stabilizationMs": 1000
+    },
+    "back": {
+      "strategy": "auto",
+      "waitUntil": "domcontentloaded",
+      "stabilizationMs": 800
+    }
+  },
+
+  "outline": {
+    "width": "3px",
+    "style": "dashed",
+    "colors": {
+      "postCard": "#69c0ff",
+      "commentsLink": "#2f54eb",
+      "postTitle": "#ff4d4f",
+      "postBody": "#faad14",
+      "comment": "#73d13d",
+      "voteButton": "#9254de"
+    }
+  },
+
+  "coco": {
+    "outputFile": "annotations.coco.json",
+    "datasetInfo": {
+      "year": 2025,
+      "version": "1.0",
+      "description": "Reddit home + post pages",
+      "contributor": "auto"
+    }
+  }
+}
