@@ -44,8 +44,17 @@
         "faceplate-tracker[source='shreddit_comment_count_button']",
         "joinConversation"
       ],
-      ["shreddit-comment", "subredditCommentThread"]
+      ["shreddit-comment", "subredditCommentThread"],
+      ["comment-composer-host", "commentComposer"]
     ],
+    "interactions": {
+      "comment": {
+        "componentSelectors": ["shreddit-comment"],
+        "buttonSelector": "svg[icon-name='comment-outline']",
+        "composerSelector": "comment-composer-host",
+        "timeoutMs": 5000
+      }
+    },
     "infiniteScroll": {
       "enabled": true,
       "stableRounds": 6,
@@ -68,11 +77,15 @@
     "style": "dashed",
     "colors": {
       "postCard": "#69c0ff",
-      "commentsLink": "#2f54eb",
+      "adPost": "#2f54eb",
       "postTitle": "#ff4d4f",
-      "postBody": "#faad14",
-      "comment": "#73d13d",
-      "voteButton": "#9254de"
+      "postImage": "#faad14",
+      "subredditCommentThread": "#73d13d",
+      "upvote": "#9254de",
+      "downvote": "#36cfc9",
+      "comment": "#eb2f96",
+      "joinConversation": "#13c2c2",
+      "commentComposer": "#fa8c16"
     }
   },
 

@@ -1,5 +1,5 @@
 // reddit_screenshot_fullscreen_targets_annotations_deep.js
-// Puppeteer v22+ compatible — Home (feed) → Post (comments) workflow with COCO output
+// Puppeteer v22+ compatible — Home (feed) → Post (comments) workflow with COCO output + comment interaction
 
 const fs = require("fs");
 const path = require("path");
@@ -66,7 +66,6 @@ function loadConfigOrCrash() {
   // open settings
   cfg.home.open = cfg.home.open || {};
   if (!cfg.home.open.selector) {
-    // default selector to find a robust link to the post page
     cfg.home.open.selector =
       "a[data-click-id='comments'], a[href*='/comments/']";
   }
@@ -95,6 +94,17 @@ function loadConfigOrCrash() {
   // caps
   if (!Number.isFinite(cfg.home.maxPerTarget)) cfg.home.maxPerTarget = 10; // max posts to open from feed
   if (!Number.isFinite(cfg.post.maxShotsPerPost)) cfg.post.maxShotsPerPost = 6; // screenshots per post page
+
+  // interactions defaults
+  if (!cfg.post.interactions) cfg.post.interactions = {};
+  if (!cfg.post.interactions.comment) {
+    cfg.post.interactions.comment = {
+      componentSelectors: ["shreddit-comment"],
+      buttonSelector: "svg[icon-name='comment-outline']",
+      composerSelector: "comment-composer-host",
+      timeoutMs: 5000,
+    };
+  }
 
   return cfg;
 }
@@ -167,9 +177,49 @@ async function centerElement(el) {
   });
 }
 
+// ----- Utility: visible descendants within a component (with pierce/ fallback) -----
+async function queryVisibleWithin(rootEl, selector) {
+  let list = [];
+  try {
+    list = await rootEl.$$(selector);
+  } catch {}
+  if (!list.length) {
+    try {
+      list = await rootEl.$$(`pierce/${selector}`);
+    } catch {}
+  }
+  const filtered = [];
+  for (const h of list) {
+    const ok = await h
+      .evaluate((node) => {
+        const s = getComputedStyle(node);
+        if (
+          s.display === "none" ||
+          s.visibility === "hidden" ||
+          s.opacity === "0"
+        )
+          return false;
+        const r = node.getBoundingClientRect();
+        return (
+          r.bottom > 0 &&
+          r.right > 0 &&
+          r.top < innerHeight &&
+          r.left < innerWidth
+        );
+      })
+      .catch(() => false);
+    if (ok) filtered.push(h);
+    else {
+      try {
+        await h.dispose();
+      } catch {}
+    }
+  }
+  return filtered;
+}
+
 // ----- Collect post links from home feed -----
 async function extractLinkFromTargetHandle(page, el, openSelector) {
-  // Try configured selector first
   const href = await el.evaluate((node, sel) => {
     function findIn(node, sel) {
       try {
@@ -178,15 +228,10 @@ async function extractLinkFromTargetHandle(page, el, openSelector) {
       } catch {}
       return null;
     }
-    // Try direct selector
     const direct = findIn(node, sel);
     if (direct) return direct;
-
-    // Fallback: any anchor to /comments/
     const alt = node.querySelector("a[href*='/comments/']");
     if (alt && alt.href) return alt.href;
-
-    // As last resort: first link inside the post
     const any = node.querySelector("a[href]");
     return any?.href || null;
   }, openSelector);
@@ -200,7 +245,6 @@ async function infiniteScrollCollectLinks(
 ) {
   const urls = new Set();
 
-  // initial harvest
   const harvest = async () => {
     for (const sel of selectors) {
       let els = await deepQueryAll(page, sel, { includeIframes }).catch(
@@ -228,7 +272,6 @@ async function infiniteScrollCollectLinks(
   await harvest();
   let stable = 0;
   while (urls.size < maxCount && stable < stableRounds) {
-    // Pause / stop handling
     while (runState === "paused") {
       await sleep(200);
     }
@@ -251,10 +294,172 @@ async function infiniteScrollCollectLinks(
   return Array.from(urls).slice(0, maxCount);
 }
 
+// ----- One capture cycle (show outlines → compute COCO bboxes → screenshot → COCO add) -----
+async function captureCycle({
+  page,
+  pageLabel,
+  shotIndex,
+  annotations,
+  includeIframes,
+  outlineStyles,
+  keepOutlines,
+  delayMs,
+  outputDir,
+  coco,
+}) {
+  const OUTLINE_WIDTH = outlineStyles.width;
+  const OUTLINE_STYLE = outlineStyles.style;
+  const colorMap = outlineStyles.colorMap;
+
+  // Gather visible annotation elements
+  const annotationHandles = [];
+  const annotationCssByHandle = new Map();
+  const annotationCatByHandle = new Map();
+
+  for (const [annSelector, category] of annotations) {
+    const color = colorMap.get(category);
+    const css = `${OUTLINE_WIDTH} ${OUTLINE_STYLE} ${color}`;
+
+    let vis = await deepQueryVisible(page, annSelector, {
+      includeIframes,
+    }).catch(() => []);
+    if (!vis.length) {
+      try {
+        const all = await page.$$(`pierce/${annSelector}`);
+        const filtered = [];
+        for (const h of all) {
+          const isVis = await h
+            .evaluate((node) => {
+              const s = getComputedStyle(node);
+              if (
+                s.display === "none" ||
+                s.visibility === "hidden" ||
+                s.opacity === "0"
+              )
+                return false;
+              const r = node.getBoundingClientRect();
+              return (
+                r.bottom > 0 &&
+                r.right > 0 &&
+                r.top < innerHeight &&
+                r.left < innerWidth
+              );
+            })
+            .catch(() => false);
+          if (isVis) filtered.push(h);
+          else {
+            try {
+              await h.dispose();
+            } catch {}
+          }
+        }
+        vis = filtered;
+      } catch {}
+    }
+
+    for (const h of vis) {
+      annotationHandles.push(h);
+      annotationCssByHandle.set(h, css);
+      annotationCatByHandle.set(h, category);
+    }
+  }
+
+  // Preview outlines
+  for (const h of annotationHandles) {
+    const css = annotationCssByHandle.get(h);
+    const cat = annotationCatByHandle.get(h);
+    try {
+      await setOutline(h, css, cat);
+    } catch {}
+  }
+  await paintSync(page);
+  await jitter(delayMs);
+
+  // Compute bboxes
+  const { dpr, vw, vh } = await page.evaluate(() => ({
+    dpr: window.devicePixelRatio || 1,
+    vw: window.innerWidth,
+    vh: window.innerHeight,
+  }));
+  const clipToViewport = (r, vw, vh) => {
+    const x1 = Math.max(0, Math.min(vw, r.left));
+    const y1 = Math.max(0, Math.min(vh, r.top));
+    const x2 = Math.max(0, Math.min(vw, r.right));
+    const y2 = Math.max(0, Math.min(vh, r.bottom));
+    const w = Math.max(0, x2 - x1);
+    const h = Math.max(0, y2 - y1);
+    return { x: x1, y: y1, w, h };
+  };
+
+  const cocoBoxes = [];
+  for (const h of annotationHandles) {
+    const cat = annotationCatByHandle.get(h);
+    if (!cat) continue;
+    const rect = await h.evaluate((node) => {
+      const r = node.getBoundingClientRect();
+      return { left: r.left, top: r.top, right: r.right, bottom: r.bottom };
+    });
+    const c = clipToViewport(rect, vw, vh);
+    if (c.w > 0 && c.h > 0) {
+      cocoBoxes.push({
+        cat,
+        bboxPx: [c.x * dpr, c.y * dpr, c.w * dpr, c.h * dpr],
+      });
+    }
+  }
+
+  // Optionally clear outlines
+  if (!keepOutlines) {
+    for (const h of annotationHandles) {
+      try {
+        await clearOutline(h);
+      } catch {}
+    }
+    await paintSync(page);
+  }
+
+  // Screenshot
+  const filename = `${toSafe(pageLabel)}__${shotIndex}.png`;
+  const filepath = path.join(outputDir, filename);
+  await page.screenshot({ path: filepath, fullPage: false });
+  console.log(`Saved: ${filepath}`);
+
+  // Restore outlines if we cleared them
+  if (!keepOutlines) {
+    for (const h of annotationHandles) {
+      try {
+        await restoreOutline(h);
+      } catch {}
+    }
+    await paintSync(page);
+  }
+  await jitter(delayMs);
+
+  // COCO entries
+  const dprNow = await page.evaluate(() => window.devicePixelRatio || 1);
+  const vwNow = await page.evaluate(() => window.innerWidth);
+  const vhNow = await page.evaluate(() => window.innerHeight);
+  const imageId = coco.addImage({
+    fileName: path.basename(filepath),
+    width: Math.round(vwNow * dprNow),
+    height: Math.round(vhNow * dprNow),
+  });
+  for (const b of cocoBoxes) {
+    coco.addAnnotation({ imageId, categoryName: b.cat, bbox: b.bboxPx });
+  }
+
+  // Cleanup
+  for (const h of annotationHandles) {
+    try {
+      await h.dispose();
+    } catch {}
+  }
+}
+
 // ----- Capture routine on a page (targets + annotations → screenshots + COCO) -----
 async function captureOnPage({
   page,
-  pageLabel, // "home" or "post" (used in filenames)
+  pageLabel, // "home" or "post_#"
   targets, // array of CSS selectors (drive scrolling)
   annotations, // array of [selector, category]
   maxShots, // total screenshots to take on this page
@@ -265,11 +470,8 @@ async function captureOnPage({
   delayMs,
   outputDir,
   coco,
+  interactions = {}, // { comment: { componentSelectors[], buttonSelector, composerSelector, timeoutMs } }
 }) {
-  const OUTLINE_WIDTH = outlineStyles.width;
-  const OUTLINE_STYLE = outlineStyles.style;
-  const colorMap = outlineStyles.colorMap;
-
   // Collect candidate target elements (with optional infinite scroll)
   let candidateEls = [];
   const collectOnce = async () => {
@@ -302,7 +504,6 @@ async function captureOnPage({
     candidateEls.length < maxShots &&
     stable < infScroll.stableRounds
   ) {
-    // Pause / stop handling
     while (runState === "paused") {
       await sleep(200);
     }
@@ -317,15 +518,16 @@ async function captureOnPage({
     );
     await sleep(infScroll.sleepMs);
     const before = candidateEls.length;
-    candidateEls = []; // refresh full set each round (handles from previous round become stale sometimes)
+    candidateEls = [];
     await collectOnce();
     if (candidateEls.length > before) stable = 0;
     else stable += 1;
   }
 
   const take = Math.min(maxShots, candidateEls.length);
+  let shotCounter = 0;
+
   for (let i = 0; i < take; i++) {
-    // Pause / stop handling
     while (runState === "paused") {
       await sleep(200);
     }
@@ -333,156 +535,112 @@ async function captureOnPage({
       console.log("🛑 Stopped by user");
       return;
     }
+
     const targetEl = candidateEls[i];
     try {
       await centerElement(targetEl);
 
-      // Gather visible annotation elements (do NOT scroll to them)
-      const annotationHandles = [];
-      const annotationCssByHandle = new Map();
-      const annotationCatByHandle = new Map();
-
-      for (const [annSelector, category] of annotations) {
-        const color = colorMap.get(category);
-        const css = `${OUTLINE_WIDTH} ${OUTLINE_STYLE} ${color}`;
-
-        let vis = await deepQueryVisible(page, annSelector, {
-          includeIframes,
-        }).catch(() => []);
-        if (!vis.length) {
-          try {
-            const all = await page.$$(`pierce/${annSelector}`);
-            const filtered = [];
-            for (const h of all) {
-              const isVis = await h
-                .evaluate((node) => {
-                  const s = getComputedStyle(node);
-                  if (
-                    s.display === "none" ||
-                    s.visibility === "hidden" ||
-                    s.opacity === "0"
-                  )
-                    return false;
-                  const r = node.getBoundingClientRect();
-                  return (
-                    r.bottom > 0 &&
-                    r.right > 0 &&
-                    r.top < innerHeight &&
-                    r.left < innerWidth
-                  );
-                })
-                .catch(() => false);
-              if (isVis) filtered.push(h);
-              else {
-                try {
-                  await h.dispose();
-                } catch {}
-              }
-            }
-            vis = filtered;
-          } catch {}
-        }
-
-        for (const h of vis) {
-          annotationHandles.push(h);
-          annotationCssByHandle.set(h, css);
-          annotationCatByHandle.set(h, category);
-        }
-      }
-
-      // Show outlines for preview
-      for (const h of annotationHandles) {
-        const css = annotationCssByHandle.get(h);
-        const cat = annotationCatByHandle.get(h);
+      // Determine if this target is a "comment component" we should interact with
+      const commentCfg = interactions.comment;
+      let isCommentComponent = false;
+      if (commentCfg && Array.isArray(commentCfg.componentSelectors)) {
         try {
-          await setOutline(h, css, cat);
-        } catch {}
+          isCommentComponent = await targetEl.evaluate((node, selectors) => {
+            return selectors.some((sel) => {
+              try {
+                return node.matches(sel);
+              } catch {
+                return false;
+              }
+            });
+          }, commentCfg.componentSelectors);
+        } catch {
+          isCommentComponent = false;
+        }
       }
-      await paintSync(page);
-      await jitter(delayMs);
 
-      // Compute COCO bboxes per annotated visible element
-      const { dpr, vw, vh } = await page.evaluate(() => ({
-        dpr: window.devicePixelRatio || 1,
-        vw: window.innerWidth,
-        vh: window.innerHeight,
-      }));
-      const clipToViewport = (r, vw, vh) => {
-        const x1 = Math.max(0, Math.min(vw, r.left));
-        const y1 = Math.max(0, Math.min(vh, r.top));
-        const x2 = Math.max(0, Math.min(vw, r.right));
-        const y2 = Math.max(0, Math.min(vh, r.bottom));
-        const w = Math.max(0, x2 - x1);
-        const h = Math.max(0, y2 - y1);
-        return { x: x1, y: y1, w, h };
-      };
-
-      const cocoBoxes = [];
-      for (const h of annotationHandles) {
-        const cat = annotationCatByHandle.get(h);
-        if (!cat) continue;
-        const rect = await h.evaluate((node) => {
-          const r = node.getBoundingClientRect();
-          return { left: r.left, top: r.top, right: r.right, bottom: r.bottom };
+      if (isCommentComponent) {
+        // 1) Normal capture
+        shotCounter += 1;
+        await captureCycle({
+          page,
+          pageLabel,
+          shotIndex: shotCounter,
+          annotations,
+          includeIframes,
+          outlineStyles,
+          keepOutlines,
+          delayMs,
+          outputDir,
+          coco,
         });
-        const c = clipToViewport(rect, vw, vh);
-        if (c.w > 0 && c.h > 0) {
-          cocoBoxes.push({
-            cat,
-            bboxPx: [c.x * dpr, c.y * dpr, c.w * dpr, c.h * dpr],
-          });
+
+        // 2) Click the comment button inside the component, wait for composer, capture again
+        try {
+          const buttons = await queryVisibleWithin(
+            targetEl,
+            commentCfg.buttonSelector
+          );
+          if (buttons.length) {
+            await buttons[0].click({ delay: 20 });
+            // wait for composer within the same component
+            const start = Date.now();
+            let composerFound = false;
+            while (Date.now() - start < (commentCfg.timeoutMs || 5000)) {
+              const comp = await queryVisibleWithin(
+                targetEl,
+                commentCfg.composerSelector
+              );
+              if (comp.length) {
+                composerFound = true;
+                // dispose temp handles
+                for (const h of comp) {
+                  try {
+                    await h.dispose();
+                  } catch {}
+                }
+                break;
+              }
+              await sleep(150);
+            }
+            // even if not found, we still take the second capture to record the state
+            shotCounter += 1;
+            await captureCycle({
+              page,
+              pageLabel,
+              shotIndex: shotCounter,
+              annotations,
+              includeIframes,
+              outlineStyles,
+              keepOutlines,
+              delayMs,
+              outputDir,
+              coco,
+            });
+          } else {
+            // No button found → just do a single normal capture (already done)
+          }
+        } catch (e) {
+          console.warn("⚠️ Comment interaction failed:", e.message);
         }
-      }
-
-      // Optionally remove outlines for clean screenshot
-      if (!keepOutlines) {
-        for (const h of annotationHandles) {
-          try {
-            await clearOutline(h);
-          } catch {}
-        }
-        await paintSync(page);
-      }
-
-      // Screenshot viewport
-      const filename = `${toSafe(pageLabel)}__${i + 1}.png`;
-      const filepath = path.join(outputDir, filename);
-      await page.screenshot({ path: filepath, fullPage: false });
-      console.log(`Saved: ${filepath}`);
-
-      // Restore outlines if we cleared them
-      if (!keepOutlines) {
-        for (const h of annotationHandles) {
-          try {
-            await restoreOutline(h);
-          } catch {}
-        }
-        await paintSync(page);
-      }
-      await jitter(delayMs);
-
-      // COCO entries
-      const imageId = coco.addImage({
-        fileName: path.basename(filepath),
-        width: Math.round(
-          (await page.evaluate(() => window.innerWidth)) *
-            (await page.evaluate(() => window.devicePixelRatio || 1))
-        ),
-        height: Math.round(
-          (await page.evaluate(() => window.innerHeight)) *
-            (await page.evaluate(() => window.devicePixelRatio || 1))
-        ),
-      });
-      for (const b of cocoBoxes) {
-        coco.addAnnotation({ imageId, categoryName: b.cat, bbox: b.bboxPx });
+      } else {
+        // Regular target → one capture
+        shotCounter += 1;
+        await captureCycle({
+          page,
+          pageLabel,
+          shotIndex: shotCounter,
+          annotations,
+          includeIframes,
+          outlineStyles,
+          keepOutlines,
+          delayMs,
+          outputDir,
+          coco,
+        });
       }
 
       // Cleanup
-      for (const h of annotationHandles) {
-        try {
-          await h.dispose();
-        } catch {}
-      }
       try {
         await targetEl.dispose();
       } catch {}
@@ -552,6 +710,7 @@ async function captureOnPage({
     const homePage = await browser.newPage();
     await homePage.goto(TARGET_URL, { waitUntil: WAIT_UNTIL, timeout: 60_000 });
 
+    // Hotkeys: start = 's', pause/resume = 'p', stop = 'e' (NOT Esc; Esc is used by Reddit)
     const applySignal = (sig) => {
       if (sig === "start") {
         if (runState === "idle") {
@@ -573,7 +732,6 @@ async function captureOnPage({
       }
     };
 
-    // Keyboard control: start (s), pause/resume (p), stop (esc)
     if (process.stdin.isTTY) process.stdin.setRawMode(true);
     process.stdin.resume();
     process.stdin.setEncoding("utf8");
@@ -581,7 +739,7 @@ async function captureOnPage({
       const low = (key || "").toLowerCase();
       if (low === "s") applySignal("start");
       else if (low === "p") applySignal("toggle");
-      else if (key === "\u001b" || key === "\u0003") applySignal("stop"); // Esc or Ctrl+C
+      else if (low === "e" || key === "\u0003") applySignal("stop"); // 'e' or Ctrl+C
     });
 
     await homePage.exposeFunction("___runSignal", (sig) => {
@@ -590,36 +748,24 @@ async function captureOnPage({
       } catch {}
     });
 
-    // For current page
-    await homePage.evaluate(() => {
+    // For current and future documents
+    const injectKeyHandler = () => {
       window.addEventListener(
         "keydown",
         (e) => {
           if (e.key === "s" || e.key === "S") window.___runSignal("start");
           else if (e.key === "p" || e.key === "P")
             window.___runSignal("toggle");
-          else if (e.key === "Escape") window.___runSignal("stop");
+          else if (e.key === "e" || e.key === "E") window.___runSignal("stop");
         },
         { capture: true }
       );
-    });
-
-    // For future navigations (new documents)
-    await homePage.evaluateOnNewDocument(() => {
-      window.addEventListener(
-        "keydown",
-        (e) => {
-          if (e.key === "s" || e.key === "S") window.___runSignal("start");
-          else if (e.key === "p" || e.key === "P")
-            window.___runSignal("toggle");
-          else if (e.key === "Escape") window.___runSignal("stop");
-        },
-        { capture: true }
-      );
-    });
+    };
+    await homePage.evaluate(injectKeyHandler);
+    await homePage.evaluateOnNewDocument(`(${injectKeyHandler.toString()})();`);
 
     console.log(
-      'Controls: press "s" to start, "p" to pause/resume, "Esc" to stop (from terminal or the browser tab).'
+      'Controls: "s" start, "p" pause/resume, "e" stop (terminal or browser tab).'
     );
 
     // Fullscreen best-effort
@@ -683,6 +829,7 @@ async function captureOnPage({
       await sleep(100);
     }
 
+    // Capture HOME
     await captureOnPage({
       page: homePage,
       pageLabel: "home",
@@ -698,9 +845,10 @@ async function captureOnPage({
       delayMs: DELAY_MS,
       outputDir: OUT_DIR,
       coco,
+      interactions: {}, // none on home
     });
 
-    // ----- Collect post links from HOME -----
+    // Collect post links
     const postLinks = await infiniteScrollCollectLinks(
       homePage,
       cfg.home.targets,
@@ -716,9 +864,8 @@ async function captureOnPage({
 
     console.log(`🧭 Collected ${postLinks.length} post link(s).`);
 
-    // ----- Visit each post → capture on POST page -----
+    // Visit each post → capture on POST page (with comment interaction)
     for (let idx = 0; idx < postLinks.length; idx++) {
-      // Pause / stop handling
       while (runState === "paused") {
         await sleep(200);
       }
@@ -726,6 +873,7 @@ async function captureOnPage({
         console.log("🛑 Stopped by user");
         break;
       }
+
       const href = postLinks[idx];
       console.log(`➡️  Opening post ${idx + 1}/${postLinks.length}: ${href}`);
 
@@ -744,7 +892,6 @@ async function captureOnPage({
         });
         await sleep(cfg.home.open.stabilizationMs);
 
-        // POST page capture
         await captureOnPage({
           page: postPage,
           pageLabel: `post_${idx + 1}`,
@@ -758,6 +905,7 @@ async function captureOnPage({
           delayMs: DELAY_MS,
           outputDir: OUT_DIR,
           coco,
+          interactions: cfg.post.interactions || {},
         });
       } catch (e) {
         console.warn(`⚠️ Failed on post page ${href}:`, e.message);
@@ -766,10 +914,8 @@ async function captureOnPage({
           try {
             await postPage.close();
           } catch {}
-          // give a tiny breather to avoid race on next newPage
           await jitter(100);
         } else {
-          // Same tab: navigate back to home
           try {
             await postPage.goBack({
               waitUntil: cfg.home.open.waitUntil,
@@ -777,7 +923,6 @@ async function captureOnPage({
             });
             await sleep(cfg.home.open.stabilizationMs);
           } catch {
-            // Fallback: reload the home URL
             try {
               await postPage.goto(TARGET_URL, {
                 waitUntil: WAIT_UNTIL,
@@ -790,7 +935,7 @@ async function captureOnPage({
       }
     }
 
-    // ----- Write COCO file -----
+    // Write COCO file
     coco.writeSync();
     console.log(
       `📝 COCO annotations saved to: ${path.relative(process.cwd(), cocoOut)}`
@@ -802,7 +947,7 @@ async function captureOnPage({
     console.error("Error:", err);
     process.exitCode = 1;
   } finally {
-    // Close the browser if you don't want to leave it open:
+    // Optional: close the browser
     // await browser.close();
   }
 })();
